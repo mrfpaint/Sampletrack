@@ -722,17 +722,23 @@ async function loadUserAndLaunch(account) {
     const name = profile.displayName || account.name;
     const email = profile.mail || profile.userPrincipalName;
     const initials = name.split(' ').map(n=>n[0]).join('').toUpperCase().slice(0,2);
-    // Look up role from local user store
-    const users = getUsers();
-    const userRecord = users.find(u => u.email.toLowerCase() === email.toLowerCase());
-    const role = userRecord?.role || 'sales'; // default to sales if not assigned
-    currentUser = { name, email, initials, role, dept: userRecord?.dept || profile.department || '' };
-    isLiveMode = IS_CONFIGURED;
+    isLiveMode = true;
+    // Load all data from SharePoint
+    await spLoadAll();
+    // Look up role from SharePoint AppUsers list
+    const userRecord = _users.find(u => u.email.toLowerCase() === email.toLowerCase());
+    const role = userRecord?.role || 'sales';
+    currentUser = { name, email, initials, role, dept: userRecord?.dept || profile.department || '', spId: userRecord?.spId };
+    // Update last login in SharePoint
+    if (userRecord) {
+      userRecord.lastLogin = new Date().toISOString();
+      spSaveUser(userRecord).catch(console.error);
+    }
     launchApp();
   } catch(e) {
-    console.error(e);
-    // Fallback: launch in demo mode with M365 identity
-    toast('SharePoint connection failed. Running in local mode.', 'info');
+    console.error('[Auth] loadUserAndLaunch error:', e);
+    toast('SharePoint connection failed — running in local mode.', 'info');
+    isLiveMode = false;
     demoMode();
   }
 }
@@ -756,6 +762,12 @@ function signOut() {
 function demoMode() {
   isDemoMode = true; isLiveMode = false;
   currentUser = { name: 'Demo User', email: 'demo@mrfpaint.com', initials: 'DU', role: 'admin', dept: 'Demo' };
+  // Seed demo data into localStorage if empty
+  const existing = localStorage.getItem('fsms_demo');
+  if (!existing || JSON.parse(existing).requests.length === 0) {
+    seed();
+    seedUsers();
+  }
   launchApp();
 }
 
@@ -766,47 +778,338 @@ function showLoading(msg) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ██  DATA LAYER  ── localStorage now; swap to SharePoint calls
+// ██  DATA LAYER  ── SharePoint via Microsoft Graph
 // ═══════════════════════════════════════════════════════════════
-const SK = 'fsms_v5', UK = 'fsms_users_v1', CK = 'fsms_cfg_v1';
+const CK = 'fsms_cfg_v1';
+const SP_SITE = 'https://mrfvapocurepaint.sharepoint.com/sites/SampleTrack';
+const SP_API  = `${SP_SITE}/_api/web/lists/getbytitle`;
 
-function load() { try { return JSON.parse(localStorage.getItem(SK))||{requests:[],ctr:1}; } catch { return {requests:[],ctr:1}; } }
-function save(d) { localStorage.setItem(SK, JSON.stringify(d)); }
-function getUsers() { try { return JSON.parse(localStorage.getItem(UK))||getDefaultUsers(); } catch { return getDefaultUsers(); } }
-function saveUsers(u) { localStorage.setItem(UK, JSON.stringify(u)); }
+// In-memory cache — populated on login, kept in sync on writes
+let _requests = [];
+let _users    = [];
+let _spToken  = null;   // SharePoint token
+let _mailToken = null;  // Mail token
+
+// ── Token helpers ────────────────────────────────────────────
+async function getToken(scopes) {
+  if (!msalInstance) return null;
+  try {
+    const accounts = msalInstance.getAllAccounts();
+    const resp = await msalInstance.acquireTokenSilent({ scopes, account: accounts[0] });
+    return resp.accessToken;
+  } catch(e) {
+    console.error('Token error:', e);
+    return null;
+  }
+}
+
+async function refreshTokens() {
+  _spToken   = await getToken(['https://mrfvapocurepaint.sharepoint.com/.default']);
+  _mailToken = await getToken(['Mail.Send']);
+}
+
+// ── SharePoint REST helpers ──────────────────────────────────
+function spHeaders(token, extra={}) {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/json;odata=nometadata',
+    'Content-Type': 'application/json',
+    ...extra
+  };
+}
+
+async function spGet(listName, token, filter='') {
+  const url = `${SP_API}('${listName}')/items?$top=5000${filter?'&$filter='+filter:''}`;
+  const r = await fetch(url, { headers: spHeaders(token) });
+  if (!r.ok) throw new Error(`SP GET ${listName} failed: ${r.status}`);
+  const d = await r.json();
+  return d.value;
+}
+
+async function spPost(listName, token, body) {
+  const url = `${SP_API}('${listName}')/items`;
+  const r = await fetch(url, { method:'POST', headers: spHeaders(token, {"X-RequestDigest": await getDigest(token)}), body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`SP POST ${listName} failed: ${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+async function spPatch(listName, token, itemId, body) {
+  const url = `${SP_API}('${listName}')/items(${itemId})`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: spHeaders(token, {
+      'X-HTTP-Method': 'MERGE',
+      'IF-MATCH': '*',
+      "X-RequestDigest": await getDigest(token)
+    }),
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error(`SP PATCH ${listName}(${itemId}) failed: ${r.status}`);
+}
+
+async function getDigest(token) {
+  const r = await fetch(`${SP_SITE}/_api/contextinfo`, {
+    method: 'POST',
+    headers: { Authorization:`Bearer ${token}`, Accept:'application/json;odata=nometadata' }
+  });
+  const d = await r.json();
+  return d.FormDigestValue;
+}
+
+// ── Request mapping ──────────────────────────────────────────
+function spToRequest(item) {
+  return {
+    id: String(item.Id),
+    spId: item.Id,
+    refNo: item.RefNo||'',
+    custName: item.CustName||'',
+    custContact: item.CustContact||'',
+    acctType: item.AcctType||'',
+    acctClass: item.AcctClass||'',
+    siteName: item.SiteName||'',
+    siteAddr: item.SiteAddr||'',
+    siteVal: item.SiteVal||'',
+    siteVol: item.SiteVol||'',
+    prods: (() => { try { return JSON.parse(item.Products||'[]'); } catch { return []; } })(),
+    inflName: item.InflName||'',
+    inflRole: item.InflRole||'',
+    dealerName: item.DealerName||'',
+    dealerLoc: item.DealerLoc||'',
+    notes: item.Notes||'',
+    status: item.Status||'Pending ASM',
+    submittedBy: item.SubmittedBy||'',
+    submittedByEmail: item.SubmittedByEmail||'',
+    submittedAt: item.SubmittedAt||new Date().toISOString(),
+    asmAt: item.AsmAt||null,
+    asmBy: item.AsmBy||null,
+    rsmAt: item.RsmAt||null,
+    rsmBy: item.RsmBy||null,
+    rejReason: item.RejReason||null,
+    sapNo: item.SapNo||null,
+    sapAt: item.SapAt||null,
+    sapBy: item.SapBy||null,
+    conv: item.Conv||'Pending',
+    convAt: item.ConvAt||null,
+    convVol: item.ConvVol||null,
+    convVal: item.ConvVal||null,
+    convRef: item.ConvRef||null,
+  };
+}
+
+function requestToSp(req) {
+  return {
+    RefNo: req.refNo,
+    CustName: req.custName,
+    CustContact: req.custContact||'',
+    AcctType: req.acctType||'',
+    AcctClass: req.acctClass||'',
+    SiteName: req.siteName,
+    SiteAddr: req.siteAddr||'',
+    SiteVal: req.siteVal ? Number(req.siteVal) : null,
+    SiteVol: req.siteVol ? Number(req.siteVol) : null,
+    Products: JSON.stringify(req.prods||[]),
+    InflName: req.inflName||'',
+    InflRole: req.inflRole||'',
+    DealerName: req.dealerName,
+    DealerLoc: req.dealerLoc||'',
+    Notes: req.notes||'',
+    Status: req.status,
+    SubmittedBy: req.submittedBy,
+    SubmittedByEmail: req.submittedByEmail,
+    SubmittedAt: req.submittedAt,
+    AsmAt: req.asmAt||'',
+    AsmBy: req.asmBy||'',
+    RsmAt: req.rsmAt||'',
+    RsmBy: req.rsmBy||'',
+    RejReason: req.rejReason||'',
+    SapNo: req.sapNo||'',
+    SapAt: req.sapAt||'',
+    SapBy: req.sapBy||'',
+    Conv: req.conv||'Pending',
+    ConvAt: req.convAt||'',
+    ConvVol: req.convVol ? Number(req.convVol) : null,
+    ConvVal: req.convVal ? Number(req.convVal) : null,
+    ConvRef: req.convRef||'',
+  };
+}
+
+// ── User mapping ─────────────────────────────────────────────
+function spToUser(item) {
+  return {
+    id: String(item.Id),
+    spId: item.Id,
+    name: item.UserName||'',
+    email: item.Email||'',
+    dept: item.Department||'',
+    role: item.Role||'sales',
+    lastLogin: item.LastLogin||null,
+  };
+}
+
+function userToSp(u) {
+  return {
+    UserName: u.name,
+    Email: u.email,
+    Department: u.dept||'',
+    Role: u.role,
+    LastLogin: u.lastLogin||'',
+  };
+}
+
+// ── Main data operations ─────────────────────────────────────
+
+// Load all data from SharePoint into memory cache
+async function spLoadAll() {
+  showLoading('Loading data from SharePoint…');
+  try {
+    await refreshTokens();
+    const [reqItems, userItems] = await Promise.all([
+      spGet('SampleRequests', _spToken),
+      spGet('AppUsers', _spToken),
+    ]);
+    _requests = reqItems.map(spToRequest);
+    _users    = userItems.map(spToUser);
+    // Generate next counter from existing refs
+    console.log(`[SP] Loaded ${_requests.length} requests, ${_users.length} users`);
+  } catch(e) {
+    console.error('[SP] Load failed:', e);
+    toast('SharePoint load failed. Check console.', 'error');
+    _requests = [];
+    _users = [];
+  }
+}
+
+// ── Local read (from cache) ──────────────────────────────────
+function load() {
+  if (isDemoMode) {
+    try { return JSON.parse(localStorage.getItem('fsms_demo'))||{requests:[],ctr:1}; } catch { return {requests:[],ctr:1}; }
+  }
+  // Build a counter from existing refNos
+  const maxCtr = _requests.reduce((max, r) => {
+    const parts = (r.refNo||'').split('-');
+    const n = parseInt(parts[parts.length-1])||0;
+    return Math.max(max, n);
+  }, 0);
+  return { requests: _requests, ctr: maxCtr + 1 };
+}
+
+function getUsers() {
+  if (isDemoMode) {
+    try { return JSON.parse(localStorage.getItem('fsms_demo_users'))||getDemoUsers(); } catch { return getDemoUsers(); }
+  }
+  return _users.length ? _users : getDemoUsers();
+}
+
+// ── Writes ───────────────────────────────────────────────────
+
+// Create new request in SharePoint
+async function spCreateRequest(req) {
+  if (isDemoMode) {
+    const d = load(); d.requests.push(req); d.ctr++;
+    localStorage.setItem('fsms_demo', JSON.stringify(d)); return;
+  }
+  try {
+    showSyncIndicator(true);
+    const created = await spPost('SampleRequests', _spToken, requestToSp(req));
+    req.spId = created.Id;
+    req.id = String(created.Id);
+    _requests.push(req);
+    showSyncIndicator(false);
+  } catch(e) {
+    showSyncIndicator(false, true);
+    console.error('[SP] Create request failed:', e);
+    toast('Failed to save to SharePoint: ' + e.message, 'error');
+    throw e;
+  }
+}
+
+// Update existing request in SharePoint
+async function spUpdateRequest(req) {
+  if (isDemoMode) {
+    const d = load();
+    const idx = d.requests.findIndex(x=>x.id===req.id);
+    if (idx>=0) d.requests[idx]=req;
+    localStorage.setItem('fsms_demo', JSON.stringify(d)); return;
+  }
+  try {
+    showSyncIndicator(true);
+    await spPatch('SampleRequests', _spToken, req.spId, requestToSp(req));
+    const idx = _requests.findIndex(x=>x.id===req.id);
+    if (idx>=0) _requests[idx]=req;
+    showSyncIndicator(false);
+  } catch(e) {
+    showSyncIndicator(false, true);
+    console.error('[SP] Update request failed:', e);
+    toast('Failed to update SharePoint: ' + e.message, 'error');
+    throw e;
+  }
+}
+
+// Create or update user in SharePoint
+async function spSaveUser(user) {
+  if (isDemoMode) {
+    const users = getUsers();
+    const idx = users.findIndex(u=>u.email.toLowerCase()===user.email.toLowerCase());
+    if (idx>=0) users[idx]=user; else users.push(user);
+    localStorage.setItem('fsms_demo_users', JSON.stringify(users)); return;
+  }
+  try {
+    showSyncIndicator(true);
+    if (user.spId) {
+      await spPatch('AppUsers', _spToken, user.spId, userToSp(user));
+      const idx = _users.findIndex(u=>u.email.toLowerCase()===user.email.toLowerCase());
+      if (idx>=0) _users[idx]=user;
+    } else {
+      const created = await spPost('AppUsers', _spToken, userToSp(user));
+      user.spId = created.Id;
+      user.id = String(created.Id);
+      const idx = _users.findIndex(u=>u.email.toLowerCase()===user.email.toLowerCase());
+      if (idx>=0) _users[idx]=user; else _users.push(user);
+    }
+    showSyncIndicator(false);
+  } catch(e) {
+    showSyncIndicator(false, true);
+    console.error('[SP] Save user failed:', e);
+    toast('Failed to save user: ' + e.message, 'error');
+    throw e;
+  }
+}
+
+async function spDeleteUser(email) {
+  if (isDemoMode) {
+    const users = getUsers().filter(u=>u.email.toLowerCase()!==email.toLowerCase());
+    localStorage.setItem('fsms_demo_users', JSON.stringify(users)); return;
+  }
+  const user = _users.find(u=>u.email.toLowerCase()===email.toLowerCase());
+  if (!user?.spId) return;
+  try {
+    await fetch(`${SP_API}('AppUsers')/items(${user.spId})`, {
+      method: 'POST',
+      headers: spHeaders(_spToken, { 'X-HTTP-Method':'DELETE', 'IF-MATCH':'*', 'X-RequestDigest': await getDigest(_spToken) })
+    });
+    _users = _users.filter(u=>u.email.toLowerCase()!==email.toLowerCase());
+  } catch(e) { console.error('[SP] Delete user failed:', e); }
+}
+
+// ── Sync indicator ───────────────────────────────────────────
+function showSyncIndicator(syncing, error=false) {
+  const spb = document.getElementById('spBadge');
+  if (!spb) return;
+  if (syncing) { spb.textContent = '⬤ Saving…'; spb.className = 'sp-badge local'; }
+  else if (error) { spb.textContent = '⬤ Sync Error'; spb.className = 'sp-badge local'; }
+  else { spb.textContent = '⬤ SharePoint Live'; spb.className = 'sp-badge live'; }
+}
+
+// ── Config ───────────────────────────────────────────────────
 function getCfg() { try { return JSON.parse(localStorage.getItem(CK))||{}; } catch { return {}; } }
 function saveCfg(c) { localStorage.setItem(CK, JSON.stringify(c)); }
 
-function getDefaultUsers() {
+// ── Demo fallback users ──────────────────────────────────────
+function getDemoUsers() {
   return [
     { name:'Demo User', email:'demo@mrfpaint.com', dept:'Demo', role:'admin', lastLogin: new Date().toISOString() },
   ];
 }
-
-// ── SharePoint integration stubs ──
-// When IS_CONFIGURED=true and a valid access token exists, replace
-// these stubs with real Microsoft Graph / SharePoint REST calls.
-//
-// Example: Load requests from SharePoint List
-// async function spLoadRequests(token) {
-//   const url = `${CONFIG.spSiteUrl}/_api/web/lists/getbytitle('${CONFIG.spListName}')/items`;
-//   const r = await fetch(url, { headers: { Authorization:`Bearer ${token}`, Accept:'application/json;odata=nometadata' }});
-//   const data = await r.json();
-//   return data.value.map(spItemToRequest);
-// }
-//
-// async function spSaveRequest(token, req) {
-//   const url = `${CONFIG.spSiteUrl}/_api/web/lists/getbytitle('${CONFIG.spListName}')/items`;
-//   await fetch(url, { method:'POST', headers:{ Authorization:`Bearer ${token}`, Accept:'application/json;odata=nometadata', 'Content-Type':'application/json' }, body: JSON.stringify(requestToSPItem(req))});
-// }
-//
-// Example: Send email via Microsoft Graph
-// async function sendEmail(token, to, subject, body) {
-//   await fetch('https://graph.microsoft.com/v1.0/me/sendMail', {
-//     method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
-//     body: JSON.stringify({ message:{ subject, body:{contentType:'HTML',content:body}, toRecipients:[{emailAddress:{address:to}}] }, saveToSentItems:true })
-//   });
-// }
 
 async function sendNotification(toEmail, subject, bodyHtml) {
   if (!isLiveMode || !msalInstance) {
@@ -857,10 +1160,7 @@ function launchApp() {
   // Show new request button for sales
   document.getElementById('topNewBtn').style.display = currentUser.role === 'sales' ? '' : 'none';
 
-  // Record last login
-  const users = getUsers();
-  const u = users.find(x => x.email.toLowerCase() === currentUser.email.toLowerCase());
-  if (u) { u.lastLogin = new Date().toISOString(); saveUsers(users); }
+  // Last login recorded in SharePoint during loadUserAndLaunch
 
   renderNav();
   showPage('page-dashboard');
@@ -1070,7 +1370,7 @@ function submitReq(){
     sapNo:null,sapAt:null,sapBy:null,
     conv:'Pending',convAt:null,convVol:null,convVal:null,convRef:null,
   };
-  d.requests.push(req); d.ctr++; save(d);
+  try { await spCreateRequest(req); } catch(e) { return; }
   // Notify ASMs
   const users=getUsers(), asms=users.filter(u=>u.role==='asm');
   asms.forEach(asm=>{
@@ -1142,11 +1442,9 @@ function approveReq(id){
   const role=currentUser?.role;
   if(role==='asm'){
     x.status='ASM Approved'; x.asmAt=new Date().toISOString(); x.asmBy=currentUser.name;
-    // Notify RSMs
     const rsms=getUsers().filter(u=>u.role==='rsm');
     rsms.forEach(rsm=>sendNotification(rsm.email,`[SampleTrack] ${x.refNo} awaiting RSM approval`,
       `<p>Hi ${rsm.name},</p><p>Request <strong>${x.refNo}</strong> for <strong>${x.custName}</strong> has been approved by ASM ${currentUser.name} and now awaits your approval.</p>`));
-    // Notify submitter
     sendNotification(x.submittedByEmail,`[SampleTrack] Your request ${x.refNo} passed ASM review`,
       `<p>Hi ${x.submittedBy},</p><p>Your sample request <strong>${x.refNo}</strong> has been approved by the ASM and is now with the RSM for final approval.</p>`);
     toast(`✅ ${x.refNo} ASM approved. RSM notified.`,'success');
@@ -1156,7 +1454,8 @@ function approveReq(id){
       `<p>Hi ${x.submittedBy},</p><p>Great news! Your sample request <strong>${x.refNo}</strong> has received full approval. Please create the SAP order and update the SAP Order Number in SampleTrack.</p>`);
     toast(`✅ ${x.refNo} fully approved! Submitter notified.`,'success');
   }
-  save(d); renderApprovals(); renderNav();
+  try { await spUpdateRequest(x); } catch(e) { return; }
+  renderApprovals(); renderNav();
 }
 
 function openReject(id){rejectId=id; document.getElementById('rejectReason').value=''; openMo('moReject');}
@@ -1170,7 +1469,8 @@ function confirmReject(){
   else{x.rsmAt=new Date().toISOString();x.rsmBy=currentUser.name;}
   sendNotification(x.submittedByEmail,`[SampleTrack] ❌ Request ${x.refNo} was rejected`,
     `<p>Hi ${x.submittedBy},</p><p>Your request <strong>${x.refNo}</strong> has been rejected by ${currentUser.name}.</p><p><strong>Reason:</strong> ${reason}</p><p>You may revise and resubmit if needed.</p>`);
-  save(d); closeMo('moReject'); toast(`❌ ${x.refNo} rejected. Submitter notified.`,'error'); renderApprovals(); renderNav();
+  try { await spUpdateRequest(x); } catch(e) { return; }
+  closeMo('moReject'); toast(`❌ ${x.refNo} rejected. Submitter notified.`,'error'); renderApprovals(); renderNav();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1202,7 +1502,8 @@ function confirmSAP(){
   if(!num){toast('Enter SAP Order Number','error');return;}
   const d=load(),x=d.requests.find(r=>r.id===sapId); if(!x)return;
   x.sapNo=num; x.status='SAP Linked'; x.sapAt=new Date().toISOString(); x.sapBy=currentUser.name;
-  save(d); closeMo('moSAP'); toast(`🔗 SAP ${num} linked to ${x.refNo}`,'success'); renderTracker(); renderNav();
+  try { await spUpdateRequest(x); } catch(e) { return; }
+  closeMo('moSAP'); toast(`🔗 SAP ${num} linked to ${x.refNo}`,'success'); renderTracker(); renderNav();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1243,7 +1544,8 @@ function confirmConv(){
   const d=load(),x=d.requests.find(r=>r.id===convId); if(!x)return;
   x.conv=outcome; x.convAt=new Date().toISOString(); x.convBy=currentUser.name;
   if(outcome==='Converted'){x.convVol=document.getElementById('convVol').value;x.convVal=document.getElementById('convVal').value;x.convRef=document.getElementById('convSAPRef').value;}
-  save(d); closeMo('moConv'); toast(outcome==='Converted'?'🎉 Conversion recorded!':'📝 Status updated','success'); renderConversion();
+  try { await spUpdateRequest(x); } catch(e) { return; }
+  closeMo('moConv'); toast(outcome==='Converted'?'🎉 Conversion recorded!':'📝 Status updated','success'); renderConversion();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1304,14 +1606,13 @@ function renderAdmin(){
 function updateUserRole(email, newRole){
   const users=getUsers(), u=users.find(x=>x.email.toLowerCase()===email.toLowerCase());
   if(!u) return;
-  u.role=newRole; saveUsers(users);
-  toast(`✅ ${u.name} set as ${roleLabel(newRole)}`,'success');
+  u.role=newRole;
+  spSaveUser(u).then(()=>toast(`✅ ${u.name} set as ${roleLabel(newRole)}`,'success')).catch(e=>toast('Role update failed: '+e.message,'error'));
   renderNav();
 }
 
 function removeUser(email){
-  const users=getUsers().filter(x=>x.email.toLowerCase()!==email.toLowerCase());
-  saveUsers(users); renderAdmin(); toast('User removed','info');
+  spDeleteUser(email).then(()=>{ renderAdmin(); toast('User removed','info'); }).catch(e=>toast('Remove failed: '+e.message,'error'));
 }
 
 function openAddUserModal(){
@@ -1326,9 +1627,10 @@ function confirmAddUser(){
   if(!name||!email){toast('Name and email are required','error');return;}
   const users=getUsers();
   const existing=users.findIndex(u=>u.email.toLowerCase()===email.toLowerCase());
-  const record={name,email,dept,role,lastLogin:null};
-  if(existing>=0) users[existing]=record; else users.push(record);
-  saveUsers(users); closeMo('moAddUser'); renderAdmin(); toast(`✅ ${name} added as ${roleLabel(role)}`,'success');
+  const existing_user = _users.find(u=>u.email.toLowerCase()===email.toLowerCase());
+  const record = existing_user ? {...existing_user, name, dept, role} : {name,email,dept,role,lastLogin:null};
+  try { await spSaveUser(record); } catch(e) { return; }
+  closeMo('moAddUser'); renderAdmin(); toast(`✅ ${name} added as ${roleLabel(role)}`,'success');
 }
 
 function saveConfig(){
@@ -1436,7 +1738,9 @@ document.querySelectorAll('.mo').forEach(o=>o.addEventListener('click',e=>{if(e.
 // ██  SEED + INIT
 // ═══════════════════════════════════════════════════════════════
 function seed(){
-  const d=load(); if(d.requests.length>0)return;
+  const raw = localStorage.getItem('fsms_demo');
+  const d = raw ? JSON.parse(raw) : {requests:[],ctr:1};
+  if(d.requests.length>0)return;
   const ago=n=>new Date(Date.now()-n*86400000).toISOString();
   d.requests=[
     {id:'r1',refNo:'FS-2025-00001',custName:'Apex Constructions',custContact:'Ramesh Kumar · 9876543210',acctType:'Direct',acctClass:'A',siteName:'Apex Tower, Whitefield',siteAddr:'Bengaluru',siteVal:'750000',siteVol:'300',prods:[{name:'UltraSeal WB',qty:'10',pk:'20L'},{name:'AquaBlock Plus',qty:'5',pk:'5kg'}],inflName:'Suresh Patel',inflRole:'Architect',dealerName:'SriRam Paints & Hardware',dealerLoc:'Whitefield',notes:'Priority site',status:'SAP Linked',submittedBy:'Arjun R. (Sales)',submittedByEmail:'arjun@demo.com',submittedAt:ago(10),asmAt:ago(9),asmBy:'Priya S. (ASM)',rsmAt:ago(8),rsmBy:'Anil M. (RSM)',rejReason:null,sapNo:'5000123456',sapAt:ago(6),sapBy:'Arjun R.',conv:'Converted',convAt:ago(2),convVol:'280',convVal:'210000',convRef:'4900098712'},
@@ -1444,22 +1748,26 @@ function seed(){
     {id:'r3',refNo:'FS-2025-00003',custName:'BuildRight Infra',custContact:'Arvind Sharma',acctType:'Distributor',acctClass:'B',siteName:'NH-44 Highway Project',siteAddr:'Chennai',siteVal:'400000',siteVol:'150',prods:[{name:'CrackFill Ultra',qty:'8',pk:'2kg'}],inflName:'',inflRole:'',dealerName:'Chennai Paints Hub',dealerLoc:'Ambattur',notes:'',status:'Pending ASM',submittedBy:'Demo User',submittedByEmail:'demo@mrfpaint.com',submittedAt:ago(2),asmAt:null,asmBy:null,rsmAt:null,rsmBy:null,rejReason:null,sapNo:null,sapAt:null,sapBy:null,conv:'Pending',convAt:null,convVol:null,convVal:null,convRef:null},
     {id:'r4',refNo:'FS-2025-00004',custName:'GreenLeaf Developers',custContact:'Meena Iyer',acctType:'Direct',acctClass:'B',siteName:'GreenLeaf Villa Township',siteAddr:'Coimbatore',siteVal:'300000',siteVol:'100',prods:[{name:'ThermoShield HT',qty:'6',pk:'20L'}],inflName:'Vikram Nair',inflRole:'Civil Engineer',dealerName:'Kovai Hardware Depot',dealerLoc:'Coimbatore',notes:'',status:'Rejected',submittedBy:'Demo User',submittedByEmail:'demo@mrfpaint.com',submittedAt:ago(7),asmAt:ago(6),asmBy:'Priya S. (ASM)',rsmAt:null,rsmBy:null,rejReason:'Insufficient site potential. Please reassess and resubmit.',sapNo:null,sapAt:null,sapBy:null,conv:'Pending',convAt:null,convVol:null,convVal:null,convRef:null},
     {id:'r5',refNo:'FS-2025-00005',custName:'Stellar Homes Pvt Ltd',custContact:'Rahul Verma',acctType:'Direct',acctClass:'A',siteName:'Stellar Skyline Tower',siteAddr:'Pune',siteVal:'950000',siteVol:'400',prods:[{name:'UltraSeal WB',qty:'15',pk:'20L'},{name:'FlexCoat Pro',qty:'10',pk:'10L'}],inflName:'',inflRole:'',dealerName:'Pune Pro Supplies',dealerLoc:'Hadapsar',notes:'',status:'Fully Approved',submittedBy:'Demo User',submittedByEmail:'demo@mrfpaint.com',submittedAt:ago(3),asmAt:ago(2),asmBy:'Priya S. (ASM)',rsmAt:ago(1),rsmBy:'Anil M. (RSM)',rejReason:null,sapNo:null,sapAt:null,sapBy:null,conv:'Pending',convAt:null,convVol:null,convVal:null,convRef:null},
-  ]; d.ctr=6; save(d);
+  ]; d.ctr=6; localStorage.setItem('fsms_demo', JSON.stringify(d));
 }
 
 // Seed demo users
 function seedUsers(){
-  const u=getUsers(); if(u.length>1) return;
-  saveUsers([
+  const raw = localStorage.getItem('fsms_demo_users');
+  const u = raw ? JSON.parse(raw) : [];
+  if(u.length>1) return;
+  const users = [
     {name:'Demo User',email:'demo@mrfpaint.com',dept:'Admin',role:'admin',lastLogin:new Date().toISOString()},
     {name:'Arjun Ramesh',email:'arjun@mrfpaint.com',dept:'Sales – South Zone',role:'sales',lastLogin:null},
     {name:'Sunita Krishnan',email:'sunita@mrfpaint.com',dept:'Sales – West Zone',role:'sales',lastLogin:null},
     {name:'Priya Sharma',email:'priya@mrfpaint.com',dept:'Sales Management',role:'asm',lastLogin:null},
     {name:'Anil Mehta',email:'anil@mrfpaint.com',dept:'Regional Management',role:'rsm',lastLogin:null},
-  ]);
+  ];
+  localStorage.setItem('fsms_demo_users', JSON.stringify(users));
 }
 
-seed(); seedUsers(); initMSAL().catch(console.error);
+// Seed only runs in demo mode - SP is the live data store
+initMSAL().catch(console.error);
 </script>
 </body>
 </html>
