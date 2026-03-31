@@ -1306,8 +1306,12 @@ async function loadUserAndLaunch(account) {
     // Effective role = highest privilege role
     const rolePriority = { admin:4, rsm:3, asm:2, ea:1.5, sales:1, st:1, bdo:1 };
     const effectiveRole = (rolePriority[secondaryRole]||0) > (rolePriority[primaryRole]||0) ? secondaryRole : primaryRole;
-    const role = effectiveRole;
-    currentUser = { name, email, initials, role, secondaryRole: secondaryRole||'', primaryRole, dept: userRecord?.dept || profile.department || '', spId: userRecord?.spId, region: userRecord?.region||'' };
+    let role = effectiveRole;
+    // AUTO-ADMIN: Force admin role for joshy.francis@mrfpaint.com with IT Admin access
+    if (email.toLowerCase() === 'joshy.francis@mrfpaint.com') {
+      role = 'admin';
+    }
+    currentUser = { name, email, initials, role, secondaryRole: '', primaryRole, dept: userRecord?.dept || profile.department || '', spId: userRecord?.spId, region: 'IT_ADMIN', itAdmin: true };
     // Update last login in SharePoint
     if (userRecord) {
       userRecord.lastLogin = new Date().toISOString();
@@ -2061,6 +2065,11 @@ function closeMobMenu() {
 }
 
 function switchRole() {
+  // PREVENT SWITCH: Locked IT Admin accounts cannot switch roles
+  if (currentUser.itAdmin || currentUser.email?.toLowerCase() === 'joshy.francis@mrfpaint.com') {
+    toast('IT Admin role is locked and cannot be switched', 'warning');
+    return;
+  }
   if (!currentUser.secondaryRole) return;
   // Swap primary and secondary roles
   const tmp = currentUser.role;
@@ -2174,7 +2183,10 @@ function launchApp() {
   // Role switcher
   const swBtn = document.getElementById('roleSwitcher');
   if (swBtn) {
-    if (currentUser.secondaryRole) {
+    // HIDE SWITCHER: Never show for IT Admin accounts
+    if (currentUser.itAdmin || currentUser.email?.toLowerCase() === 'joshy.francis@mrfpaint.com') {
+      swBtn.style.display = 'none';
+    } else if (currentUser.secondaryRole) {
       swBtn.style.display = 'inline-block';
       swBtn.textContent = '⇄ Switch to ' + roleLabel(currentUser.secondaryRole);
     } else {
